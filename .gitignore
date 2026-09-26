@@ -1,0 +1,9 @@
+data/
+.env
+__pycache__/
+*.zip
+
+# Personal job-search material - kept local, not for the public repo
+docs/PROJECT_CONTEXT.md
+docs/*.xlsx
+docs/glossary.md
