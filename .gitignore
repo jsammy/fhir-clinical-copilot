@@ -3,7 +3,7 @@ data/
 __pycache__/
 *.zip
 
-# Personal job-search material - kept local, not for the public repo
+# Personal material - kept local, not for the public repo
+docs/private/
 docs/PROJECT_CONTEXT.md
 docs/*.xlsx
-docs/glossary.md
