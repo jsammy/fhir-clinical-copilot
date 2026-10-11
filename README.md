@@ -23,7 +23,7 @@ evaluation as the product — not as decoration around a prompt.
 
 | Layer | Purpose | Status |
 |---|---|---|
-| **Data** | Synthea FHIR R4 transaction bundles loaded into a FHIR server (HAPI for dev, AWS HealthLake as the managed option) | Planned |
+| **Data** | Synthea FHIR R4 transaction bundles loaded into a FHIR server (HAPI for dev, AWS HealthLake as the managed option) | Working — local HAPI, 50-patient seeded sample, 10 verification searches |
 | **Retrieval** | Bundles flattened into patient-level chunks with resource IDs preserved through to the answer | Planned |
 | **Generation** | Cited answers, guardrails, explicit refusals, full audit log of every query | Planned |
 | **Agent** | Read-only FHIR exposed as MCP tools; pre-visit summary behind a human approval step | Planned |
@@ -62,6 +62,15 @@ src/eval/        golden set, groundedness scoring, subgroup analysis
 docs/            glossary.md; model card and risk table to follow
 notebooks/       exploration
 data/            Synthea extracts — gitignored, never committed
+```
+
+## Running the data layer
+
+```
+docker compose up -d                              # HAPI FHIR R4 at http://localhost:8080/fhir
+pip install -e .
+python -m src.ingest.load_bundles --limit 50      # shared org/practitioner bundles first, then patients
+python -m src.ingest.saved_queries                # 10 verification searches
 ```
 
 Loaders are shipped, data is not. Regenerate the cohort with Synthea, or download the published

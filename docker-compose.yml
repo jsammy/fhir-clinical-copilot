@@ -1,0 +1,14 @@
+# Local FHIR R4 server for development. HealthLake is the managed equivalent on AWS.
+# Start:  docker compose up -d      Logs: docker compose logs -f hapi
+# Ready when http://localhost:8080/fhir/metadata returns a CapabilityStatement (~1-2 min).
+services:
+  hapi:
+    image: hapiproject/hapi:v7.4.0
+    container_name: fhir-hapi
+    ports:
+      - "8080:8080"
+    environment:
+      hapi.fhir.fhir_version: R4
+      # Cap the JVM so it fits alongside an IDE on an 8 GB laptop.
+      JAVA_TOOL_OPTIONS: "-Xmx2g"
+    restart: unless-stopped
