@@ -1,14 +1,22 @@
 [project]
 name = "fhir-clinical-copilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Grounded clinical Q&A over HL7 FHIR R4 with resource-level citations (synthetic data only)"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
+    "pydantic>=2.7",
+    "fastmcp>=3.1,<4",
+    "mcp>=1.26",
+    "langchain-core>=1.0",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=3.0",
+    "langchain-mcp-adapters>=0.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+aws = ["langchain-aws>=1.9", "boto3>=1.40"]
+dev = ["pytest>=8", "pytest-asyncio>=1.0"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -17,3 +25,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

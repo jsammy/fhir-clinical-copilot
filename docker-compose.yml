@@ -2,7 +2,17 @@
 # Start:  docker compose up -d      Logs: docker compose logs -f hapi
 # Ready when http://localhost:8080/fhir/metadata returns a CapabilityStatement (~1-2 min).
 services:
+  # The HAPI image is distroless and runs as uid 65532; a fresh named volume is root-owned, so
+  # hand it over once before the server starts.
+  hapi-volume-init:
+    image: busybox:1.36
+    command: ["chown", "-R", "65532:65532", "/data/hapi"]
+    volumes:
+      - hapi-data:/data/hapi
   hapi:
+    depends_on:
+      hapi-volume-init:
+        condition: service_completed_successfully
     image: hapiproject/hapi:v7.4.0
     container_name: fhir-hapi
     ports:
@@ -11,4 +21,12 @@ services:
       hapi.fhir.fhir_version: R4
       # Cap the JVM so it fits alongside an IDE on an 8 GB laptop.
       JAVA_TOOL_OPTIONS: "-Xmx2g"
+      # H2 on a named volume: without it the database lives in the container layer and an
+      # image re-pull or container rebuild silently empties the server.
+      spring.datasource.url: "jdbc:h2:file:/data/hapi/h2"
+    volumes:
+      - hapi-data:/data/hapi
     restart: unless-stopped
+
+volumes:
+  hapi-data:

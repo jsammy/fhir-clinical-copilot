@@ -23,10 +23,10 @@ evaluation as the product — not as decoration around a prompt.
 
 | Layer | Purpose | Status |
 |---|---|---|
-| **Data** | Synthea FHIR R4 transaction bundles loaded into a FHIR server (HAPI for dev, AWS HealthLake as the managed option) | Working — local HAPI, 50-patient seeded sample, 10 verification searches |
+| **Data** | Synthea FHIR R4 transaction bundles loaded into a FHIR server (HAPI for dev, AWS HealthLake as the managed option) | Working — local HAPI on a persistent volume, 50-patient seeded sample, resumable loader, 10 verification searches (also run against the public HAPI server) |
 | **Retrieval** | Bundles flattened into patient-level chunks with resource IDs preserved through to the answer | Planned |
-| **Generation** | Cited answers, guardrails, explicit refusals, full audit log of every query | Planned |
-| **Agent** | Read-only FHIR exposed as MCP tools; pre-visit summary behind a human approval step | Planned |
+| **Generation** | Cited answers, guardrails, explicit refusals, full audit log of every query | Partly working — cited narrative on Bedrock (Claude Haiku 4.5), citation validator, injection tripwire, audit log for the pre-visit summary; free-text Q&A planned |
+| **Agent** | Read-only FHIR exposed as MCP tools; pre-visit summary behind a human approval step | Working — 7 read-only MCP tools, LangGraph agent with a fixed tool plan, code-written safety sections, retry-then-withhold on citation failures, `interrupt()` approval with SQLite checkpoints |
 | **Evaluation** | Golden Q&A set, groundedness and hallucination scoring, subgroup checks across age and sex | Planned |
 | **Documentation** | Model card, ISO-14971-style risk table, PCCP-style change note | Planned |
 
@@ -59,7 +59,8 @@ src/retrieval/   chunking, embedding, vector search
 src/api/         query endpoint, citation assembly, audit logging
 src/agent/       MCP tools and the pre-visit summary agent
 src/eval/        golden set, groundedness scoring, subgroup analysis
-docs/            glossary.md; model card and risk table to follow
+docs/            glossary, FHIR cheat-sheet, AWS failure modes; model card and risk table to follow
+tests/           guards, MCP surface, agent graph
 notebooks/       exploration
 data/            Synthea extracts — gitignored, never committed
 ```
@@ -72,6 +73,31 @@ pip install -e .
 python -m src.ingest.load_bundles --limit 50      # shared org/practitioner bundles first, then patients
 python -m src.ingest.saved_queries                # 10 verification searches
 ```
+
+## Running the pre-visit agent
+
+```
+pip install -e ".[aws,dev]"
+pytest                                            # 39 tests; no Docker or AWS needed
+python -m src.agent.previsit_cli                  # demo patient, code-written sections only, asks you to approve
+cp .env.example .env                              # then set COPILOT_LLM=bedrock, the Bedrock API key, region
+python -m src.agent.previsit_cli                  # same run with a cited narrative from Bedrock
+```
+
+How it works:
+
+1. The CLI starts the MCP server (`src/agent/mcp_server.py`) over stdio and refuses to run unless
+   its tools exactly match the allow-list.
+2. The agent (`src/agent/graph.py`) resolves the patient, then runs a fixed set of seven reads.
+   The model is never given tools.
+3. Allergies, medications and problems are written by code from the coded resources. The model
+   writes only a short narrative, and every sentence must cite a resource fetched for this patient.
+4. The run pauses for a clinician's approve/reject. The decision is written to an audit log of
+   resource references and hashes, not record content.
+
+Every guard is tested in `tests/`, including a planted prompt-injection note. See
+`docs/aws_failure_modes.md` for failures observed while building, and `docs/fhir_cheatsheet.md`
+for the FHIR searches used.
 
 Loaders are shipped, data is not. Regenerate the cohort with Synthea, or download the published
 FHIR R4 sample set, and place it under `data/`.

@@ -11,6 +11,7 @@ resource-by-resource — so a patient's record loads atomically or not at all.
 Usage:
     python -m src.ingest.load_bundles --limit 50            # dev subset, seeded sample
     python -m src.ingest.load_bundles --limit 0             # everything (slow on H2)
+    python -m src.ingest.load_bundles --skip-existing       # resume an interrupted load
     python -m src.ingest.load_bundles --base-url https://<healthlake-endpoint>/r4
 """
 
@@ -24,6 +25,8 @@ import time
 from pathlib import Path
 
 import httpx
+
+from src.ingest.saved_queries import SYNTHEA_ID_SYSTEM
 
 SHARED_PREFIXES = ("hospitalInformation", "practitionerInformation")
 FHIR_JSON = "application/fhir+json"
@@ -78,6 +81,13 @@ def patient_id(path: Path) -> str:
     return path.stem.rsplit("_", 1)[-1]
 
 
+def already_loaded(client: httpx.Client, synthea_id: str) -> bool:
+    """POST is not idempotent, so a re-run would duplicate every patient; check the identifier first."""
+    resp = client.get(f"Patient?identifier={SYNTHEA_ID_SYSTEM}%7C{synthea_id}&_summary=count")
+    resp.raise_for_status()
+    return resp.json().get("total", 0) > 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://localhost:8080/fhir")
@@ -86,6 +96,8 @@ def main() -> None:
     ap.add_argument("--max-mb", type=float, default=10.0, help="skip patient bundles larger than this")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--skip-shared", action="store_true", help="hospital/practitioner already loaded")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip patients already on the server (implies --skip-shared); resumes a broken load")
     args = ap.parse_args()
 
     shared, patients = split_files(args.fhir_dir)
@@ -97,7 +109,7 @@ def main() -> None:
     with httpx.Client(base_url=args.base_url, timeout=httpx.Timeout(600.0, connect=10.0)) as client:
         client.get("/metadata").raise_for_status()
 
-        if not args.skip_shared:
+        if not (args.skip_shared or args.skip_existing):
             for path in shared:
                 ok, detail = post_bundle(client, path)
                 print(f"[shared] {path.name}: {'ok' if ok else 'FAILED'} ({detail})")
@@ -105,6 +117,10 @@ def main() -> None:
                     sys.exit("Shared reference bundles must load before patients; stopping.")
 
         for i, path in enumerate(selected, 1):
+            if args.skip_existing and already_loaded(client, patient_id(path)):
+                print(f"[{i}/{len(selected)}] {path.name[:60]}: already on server, skipped")
+                loaded.append(patient_id(path))
+                continue
             start = time.perf_counter()
             ok, detail = post_bundle(client, path)
             secs = time.perf_counter() - start
