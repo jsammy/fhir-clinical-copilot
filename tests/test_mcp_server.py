@@ -42,3 +42,18 @@ async def test_category_is_an_enum() -> None:
         result = await client.call_tool(
             "get_observations", {"patient_id": "1", "category": "laboratory&_revinclude=*"}, raise_on_error=False)
         assert result.is_error
+
+
+async def test_patient_id_schema_tells_clients_the_format() -> None:
+    """Issue #13: a model choosing tools sees the constraint and what the id is."""
+    async with Client(mcp) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+        prop = tools["get_allergies"].inputSchema["properties"]["patient_id"]
+        assert prop.get("pattern") and "find_patient" in prop.get("description", "")
+
+
+async def test_complete_list_tools_expose_truncation() -> None:
+    async with Client(mcp) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+        for name in ("get_conditions", "get_medications", "get_allergies"):
+            assert "truncated" in tools[name].outputSchema["properties"], name

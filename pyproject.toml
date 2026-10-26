@@ -12,6 +12,7 @@ dependencies = [
     "langgraph>=1.0",
     "langgraph-checkpoint-sqlite>=3.0",
     "langchain-mcp-adapters>=0.2",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +30,5 @@ include = ["src*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["live: needs the local HAPI server with the loaded cohort (pytest -m live)"]
+addopts = "-m 'not live'"

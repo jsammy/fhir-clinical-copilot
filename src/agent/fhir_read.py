@@ -8,8 +8,12 @@ not by asking the model nicely:
 - every result is reduced to a compact `Fact` that keeps its FHIR reference ("Condition/123")
   so the summary can cite it, and every free-text field passes through the injection guard.
 
-Paging is followed up to a hard cap: a patient with 4,000 observations must not turn one tool
-call into an unbounded crawl (on Lambda that is the 15-minute timeout arriving early).
+Two kinds of read, with different completeness rules:
+
+- *complete lists* (conditions, medications, allergies) are followed page by page up to a hard cap.
+  If the cap is hit, the result says `truncated=True`, because an incomplete safety list must never
+  look complete;
+- *latest N* reads (observations, encounters, notes) stop as soon as N results are in.
 """
 
 from __future__ import annotations
@@ -29,6 +33,9 @@ ALLOWED_RESOURCES = frozenset(
 )
 MAX_PAGES = 5
 
+# Clinical statuses that mean "this problem is current". Recurrence and relapse are active too.
+ACTIVE_CONDITION_STATUSES = "active,recurrence,relapse"
+
 
 class Fact(BaseModel):
     """One citable statement taken from one FHIR resource."""
@@ -40,30 +47,37 @@ class Fact(BaseModel):
     detail: dict[str, Any] = {}
 
 
+class Facts(BaseModel):
+    count: int
+    facts: list[Fact]
+    # True when a complete-list read hit the page cap: more records exist than were returned.
+    truncated: bool = False
+
+
 class ReadOnlyFhir:
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 30.0, transport: httpx.BaseTransport | None = None) -> None:
+        # `transport` lets tests replay recorded FHIR responses without a server.
         self._client = httpx.Client(
-            base_url=base_url, timeout=timeout, headers={"Accept": "application/fhir+json"}
+            base_url=base_url, timeout=timeout, headers={"Accept": "application/fhir+json"}, transport=transport
         )
 
     def close(self) -> None:
         self._client.close()
 
     # -- the only network call in this module ------------------------------------------------
-    def _search(self, resource: str, params: str) -> list[dict]:
-        return self._search_with_includes(resource, params)[0]
+    def _search(self, resource: str, params: str, limit: int | None = None
+                ) -> tuple[list[dict], dict[str, dict], bool]:
+        """(matches, {"Type/id": resource} for _include'd entries, truncated).
 
-    def _search_with_includes(self, resource: str, params: str) -> tuple[list[dict], dict[str, dict]]:
-        """(matches, {"Type/id": resource} for _include'd entries). Includes are kept apart so a
-        referenced Medication can be named without ever being mistaken for a patient fact."""
+        limit=None reads a complete list (up to MAX_PAGES) and reports truncation; a limit stops as
+        soon as that many matches are in, since "latest N" is complete by definition. Included
+        entries are kept apart so a referenced Medication is never mistaken for a patient fact."""
         if resource not in ALLOWED_RESOURCES:
             raise PermissionError(f"{resource} is not on the read allow-list")
         url: str | None = encode_pipes(f"{resource}?{params}")
         matches: list[dict] = []
         includes: dict[str, dict] = {}
         for _ in range(MAX_PAGES):
-            if url is None:
-                break
             resp = self._client.get(url)
             resp.raise_for_status()
             body = resp.json()
@@ -73,13 +87,18 @@ class ReadOnlyFhir:
                 else:
                     includes[_ref(e["resource"])] = e["resource"]
             url = next((link["url"] for link in body.get("link", []) if link["relation"] == "next"), None)
-        return matches, includes
+            if url is None or (limit is not None and len(matches) >= limit):
+                break
+        truncated = limit is None and url is not None
+        return (matches[:limit] if limit else matches), includes, truncated
 
     # -- patient resolution ------------------------------------------------------------------
-    def find_patient(self, synthea_id: str) -> dict | None:
-        found = self._search("Patient", f"identifier={SYNTHEA_ID_SYSTEM}|{check_id(synthea_id)}")
+    def find_patient(self, synthea_id: str) -> tuple[dict | None, int]:
+        """(patient, number of matches). Only exactly one match resolves; the count says whether
+        the patient is missing (0) or was loaded twice (2+)."""
+        found, _, _ = self._search("Patient", f"identifier={SYNTHEA_ID_SYSTEM}|{check_id(synthea_id)}")
         if len(found) != 1:
-            return None
+            return None, len(found)
         p = found[0]
         name = (p.get("name") or [{}])[0]
         return {
@@ -91,24 +110,26 @@ class ReadOnlyFhir:
             "birth_date": p.get("birthDate"),
             "deceased": "deceasedDateTime" in p or p.get("deceasedBoolean", False),
             "deceased_date": p.get("deceasedDateTime", "")[:10] or None,
-        }
+        }, 1
 
     # -- patient-scoped reads ----------------------------------------------------------------
-    def conditions(self, pid: str, active_only: bool = True) -> list[Fact]:
+    def conditions(self, pid: str, active_only: bool = True) -> Facts:
         check_id(pid)
-        q = f"patient={pid}" + ("&clinical-status=active" if active_only else "") + "&_count=100"
-        return [
+        q = f"patient={pid}" + (f"&clinical-status={ACTIVE_CONDITION_STATUSES}" if active_only else "") + "&_count=100"
+        rows, _, truncated = self._search("Condition", q)
+        return _facts([
             Fact(ref=_ref(r), kind="Condition", text=_code_text(r.get("code")),
                  date=r.get("onsetDateTime", "")[:10] or None,
-                 detail={"status": _first_code(r.get("clinicalStatus"))})
-            for r in self._search("Condition", q)
-        ]
+                 detail={"status": _first_code(r.get("clinicalStatus")),
+                         "snomed": _first_code(r.get("code"), "http://snomed.info/sct")})
+            for r in rows
+        ], truncated)
 
-    def medications(self, pid: str) -> list[Fact]:
+    def medications(self, pid: str) -> Facts:
         check_id(pid)
         # Synthea names most drugs inline (medicationCodeableConcept) but some orders point at a
         # separate Medication resource; _include fetches those in the same request.
-        rows, included = self._search_with_includes(
+        rows, included, truncated = self._search(
             "MedicationRequest", f"patient={pid}&status=active&_include=MedicationRequest:medication&_count=100")
 
         def drug(r: dict) -> str:
@@ -117,56 +138,67 @@ class ReadOnlyFhir:
             med = included.get(r.get("medicationReference", {}).get("reference", ""))
             return _code_text((med or {}).get("code")) or "medication (name not resolvable)"
 
-        return [
+        return _facts([
             Fact(ref=_ref(r), kind="MedicationRequest", text=drug(r),
                  date=r.get("authoredOn", "")[:10] or None,
                  detail={"dosage": sanitize_text(((r.get("dosageInstruction") or [{}])[0]).get("text", ""))})
             for r in rows
-        ]
+        ], truncated)
 
-    def allergies(self, pid: str) -> list[Fact]:
+    def allergies(self, pid: str) -> Facts:
         check_id(pid)
-        return [
-            Fact(ref=_ref(r), kind="AllergyIntolerance", text=_code_text(r.get("code")),
-                 date=r.get("recordedDate", "")[:10] or None,
-                 detail={"criticality": r.get("criticality"),
-                         "reactions": [_code_text(m) for rx in r.get("reaction", []) for m in rx.get("manifestation", [])]})
-            for r in self._search("AllergyIntolerance", f"patient={pid}&_count=100")
-        ]
+        rows, _, truncated = self._search("AllergyIntolerance", f"patient={pid}&_count=100")
+        facts = []
+        for r in rows:
+            verification = _first_code(r.get("verificationStatus"))
+            if verification == "entered-in-error":
+                continue  # recorded by mistake: not a fact about the patient
+            facts.append(Fact(
+                ref=_ref(r), kind="AllergyIntolerance", text=_code_text(r.get("code")),
+                date=r.get("recordedDate", "")[:10] or None,
+                detail={"criticality": r.get("criticality"),
+                        "clinical_status": _first_code(r.get("clinicalStatus")),
+                        "verification": verification,
+                        "reactions": [_code_text(m) for rx in r.get("reaction", []) for m in rx.get("manifestation", [])]}))
+        return _facts(facts, truncated)
 
-    def observations(self, pid: str, category: str = "laboratory", count: int = 20) -> list[Fact]:
+    def observations(self, pid: str, category: str = "laboratory", count: int = 20) -> Facts:
         check_id(pid)
-        rows = self._search("Observation", f"patient={pid}&category={category}&_sort=-date&_count={count}")[:count]
-        return [
+        rows, _, _ = self._search("Observation", f"patient={pid}&category={category}&_sort=-date&_count={count}", limit=count)
+        return _facts([
             Fact(ref=_ref(r), kind="Observation", text=_code_text(r.get("code")),
                  date=r.get("effectiveDateTime", "")[:10] or None, detail={"value": _value(r)})
             for r in rows
-        ]
+        ])
 
-    def encounters(self, pid: str, count: int = 5) -> list[Fact]:
+    def encounters(self, pid: str, count: int = 5) -> Facts:
         check_id(pid)
-        rows = self._search("Encounter", f"patient={pid}&_sort=-date&_count={count}")[:count]
-        return [
+        rows, _, _ = self._search("Encounter", f"patient={pid}&_sort=-date&_count={count}", limit=count)
+        return _facts([
             Fact(ref=_ref(r), kind="Encounter",
                  text=_code_text((r.get("type") or [None])[0]) or "encounter",
                  date=r.get("period", {}).get("start", "")[:10] or None,
                  detail={"class": r.get("class", {}).get("code"),
                          "reason": ", ".join(_code_text(c) for c in r.get("reasonCode", []))})
             for r in rows
-        ]
+        ])
 
-    def notes(self, pid: str, count: int = 2, max_chars: int = 1500) -> list[Fact]:
+    def notes(self, pid: str, count: int = 2, max_chars: int = 1500) -> Facts:
         """Free-text clinical notes: the highest prompt-injection exposure in the record, because
         their content is authored text rather than coded data."""
         check_id(pid)
-        rows = self._search("DocumentReference", f"patient={pid}&_sort=-date&_count={count}")[:count]
+        rows, _, _ = self._search("DocumentReference", f"patient={pid}&_sort=-date&_count={count}", limit=count)
         facts = []
         for r in rows:
             att = ((r.get("content") or [{}])[0]).get("attachment", {})
             raw = base64.b64decode(att["data"]).decode("utf-8", "replace") if att.get("data") else ""
             facts.append(Fact(ref=_ref(r), kind="DocumentReference", text=sanitize_text(raw[:max_chars]),
                               date=r.get("date", "")[:10] or None))
-        return facts
+        return _facts(facts)
+
+
+def _facts(items: list[Fact], truncated: bool = False) -> Facts:
+    return Facts(count=len(items), facts=items, truncated=truncated)
 
 
 def _ref(r: dict) -> str:
@@ -180,8 +212,8 @@ def _code_text(cc: dict | None) -> str:
     return sanitize_text(text)
 
 
-def _first_code(cc: dict | None) -> str | None:
-    return next((c.get("code") for c in (cc or {}).get("coding", [])), None)
+def _first_code(cc: dict | None, system: str | None = None) -> str | None:
+    return next((c.get("code") for c in (cc or {}).get("coding", []) if system is None or c.get("system") == system), None)
 
 
 def _value(r: dict) -> str:

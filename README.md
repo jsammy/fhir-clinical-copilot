@@ -24,9 +24,10 @@ evaluation as the product — not as decoration around a prompt.
 | Layer | Purpose | Status |
 |---|---|---|
 | **Data** | Synthea FHIR R4 transaction bundles loaded into a FHIR server (HAPI for dev, AWS HealthLake as the managed option) | Working — local HAPI on a persistent volume, 50-patient seeded sample, resumable loader, 10 verification searches (also run against the public HAPI server) |
-| **Retrieval** | Bundles flattened into patient-level chunks with resource IDs preserved through to the answer | Planned |
+| **Retrieval** | Coded facts come from exact FHIR queries; free-text notes are chunked by section and searched with hybrid keyword (BM25) + vector ranking, always filtered to one patient | Working — notes index over 2,010 notes (2,989 chunks), offline embedder; Titan V2 embeddings ready, live run pending |
 | **Generation** | Cited answers, guardrails, explicit refusals, full audit log of every query | Partly working — cited narrative on Bedrock (Claude Haiku 4.5), citation validator, injection tripwire, audit log for the pre-visit summary; free-text Q&A planned |
-| **Agent** | Read-only FHIR exposed as MCP tools; pre-visit summary behind a human approval step | Working — 7 read-only MCP tools, LangGraph agent with a fixed tool plan, code-written safety sections, retry-then-withhold on citation failures, `interrupt()` approval with SQLite checkpoints |
+| **Workflow** | Pre-visit summary behind a human approval step | Working — fixed tool plan, code-written safety sections, retry-then-withhold on citation failures, `interrupt()` approval with SQLite checkpoints |
+| **Agent** | Free-form questions: the model chooses among 8 read-only MCP tools, routing coded questions to FHIR and narrative ones to notes search | Built and tested with a scripted model — patient pinned by code, tool budget, citation check, audit; live Bedrock run and routing eval pending |
 | **Evaluation** | Golden Q&A set, groundedness and hallucination scoring, subgroup checks across age and sex | Planned |
 | **Documentation** | Model card, ISO-14971-style risk table, PCCP-style change note | Planned |
 
@@ -55,10 +56,10 @@ Synthea FHIR R4 bundles
 
 ```
 src/ingest/      FHIR bundle loading and flattening
-src/retrieval/   chunking, embedding, vector search
+src/retrieval/   notes chunking, embedders (offline hash, Titan V2), hybrid search
 src/api/         query endpoint, citation assembly, audit logging
-src/agent/       MCP tools and the pre-visit summary agent
-src/eval/        golden set, groundedness scoring, subgroup analysis
+src/agent/       MCP tools, the pre-visit workflow, the Q&A agent
+src/eval/        routing golden set and scorer; groundedness and subgroup checks to follow
 docs/            glossary, FHIR cheat-sheet, AWS failure modes; model card and risk table to follow
 tests/           guards, MCP surface, agent graph
 notebooks/       exploration
@@ -78,7 +79,8 @@ python -m src.ingest.saved_queries                # 10 verification searches
 
 ```
 pip install -e ".[aws,dev]"
-pytest                                            # 39 tests; no Docker or AWS needed
+pytest                                            # 124 tests; no Docker or AWS needed
+pytest -m live -o addopts=""                      # 2 more against the local HAPI cohort
 python -m src.agent.previsit_cli                  # demo patient, code-written sections only, asks you to approve
 cp .env.example .env                              # then set COPILOT_LLM=bedrock, the Bedrock API key, region
 python -m src.agent.previsit_cli                  # same run with a cited narrative from Bedrock
@@ -86,18 +88,43 @@ python -m src.agent.previsit_cli                  # same run with a cited narrat
 
 How it works:
 
-1. The CLI starts the MCP server (`src/agent/mcp_server.py`) over stdio and refuses to run unless
-   its tools exactly match the allow-list.
-2. The agent (`src/agent/graph.py`) resolves the patient, then runs a fixed set of seven reads.
-   The model is never given tools.
+1. The CLI starts the MCP server (`src/agent/mcp_server.py`) over stdio, with no cloud credentials
+   in its environment, and refuses to run unless its tools exactly match the allow-list.
+2. The workflow (`src/agent/graph.py`) resolves the patient, then runs a fixed set of seven reads.
+   Code decides the path; the model has no tool that reads or changes data.
 3. Allergies, medications and problems are written by code from the coded resources. The model
    writes only a short narrative, and every sentence must cite a resource fetched for this patient.
-4. The run pauses for a clinician's approve/reject. The decision is written to an audit log of
-   resource references and hashes, not record content.
+4. The exact text shown for review is frozen and hashed, then the run pauses for a clinician's
+   approve or reject (a rejection needs a reason). The decision goes to a hash-chained audit log of
+   resource references and hashes, not record content. Crashed runs are audited as failed.
+5. While a review is pending, the full record sits in the SQLite checkpoint so the run can resume.
+   A finalized run's checkpoints are deleted. With real data that store would also need encryption.
 
-Every guard is tested in `tests/`, including a planted prompt-injection note. See
-`docs/aws_failure_modes.md` for failures observed while building, and `docs/fhir_cheatsheet.md`
+Every guard is tested in `tests/`, including a planted prompt-injection note and real-data checks
+over the whole cohort. See `docs/aws_failure_modes.md` for failures observed while building, and `docs/fhir_cheatsheet.md`
 for the FHIR searches used.
+
+## Asking the agent a question
+
+```
+python -m src.retrieval.notes_index build         # once; NOTES_EMBEDDER=hash (offline) or bedrock (Titan)
+python -m src.agent.ask_cli "Has his blood pressure changed since he started lisinopril?"
+python -m src.eval.routing_eval                   # score tool routing on the golden set
+```
+
+The pre-visit summary is a **workflow**: it always needs the same reads, so code decides the path.
+Free-form questions need an **agent**: the path depends on the question. The agent:
+
+1. never chooses the patient: it is resolved by code first, the tool schemas have no patient id,
+   and every call gets the pinned id injected;
+2. may call only the 7 read-only data tools, at most 6 times per question; after that it is told to
+   answer, and stopped if it keeps calling tools;
+3. routes coded questions (medications, labs, diagnoses) to exact FHIR lookups and narrative ones
+   (smoking, symptoms, plans) to `search_notes`, a hybrid keyword + vector search over that
+   patient's notes only;
+4. must cite, in every sentence, a resource a tool returned in this run; one retry, then the answer
+   is withheld. "Not in record." is a valid answer;
+5. writes one hash-chained audit record per question, with the question and search text hashed.
 
 Loaders are shipped, data is not. Regenerate the cohort with Synthea, or download the published
 FHIR R4 sample set, and place it under `data/`.

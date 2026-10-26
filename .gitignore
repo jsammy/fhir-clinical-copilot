@@ -7,3 +7,4 @@ __pycache__/
 docs/private/
 docs/PROJECT_CONTEXT.md
 docs/*.xlsx
+.coverage

@@ -2,12 +2,17 @@
 
     python -m src.agent.previsit_cli                                   # demo patient, asks you
     python -m src.agent.previsit_cli --patient <synthea-uuid> --decision approve --reason "checked"
+    python -m src.agent.previsit_cli --thread <id>                     # resume a paused review
     COPILOT_LLM=bedrock python -m src.agent.previsit_cli               # with the Bedrock narrative
 
-What happens: the MCP server is started as a child process over stdio; its advertised tools must
-match the allow-list exactly or nothing runs. The graph runs until human_review pauses it, the
-draft is shown, your decision resumes it, and one audit line is written. State lives in a SQLite
-checkpoint, so a paused run can be resumed later with --thread.
+What happens: the MCP server is started as a child process over stdio, with a minimal environment
+(no cloud credentials); its advertised tools must match the allow-list exactly or nothing runs.
+The graph runs until human_review pauses it, the draft is shown, your decision resumes it, and one
+audit line is written. A run that crashes is audited as failed.
+
+The SQLite checkpoint holds the full record while a review is pending; it is what lets a paused run
+resume later. Once a run is finalized its checkpoints are deleted, so the store does not become a
+second copy of the chart. With real data the store would also need encryption at rest.
 """
 
 from __future__ import annotations
@@ -21,93 +26,91 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from src.agent.graph import build_graph
-from src.agent.guards import TOOL_ALLOW_LIST
-from src.agent.llm import make_narrator, model_id
+from src.agent.graph import audit_failure, build_graph
+from src.agent.llm import make_narrator
+from src.agent.mcp_session import fhir_tools, load_dotenv  # noqa: F401  (load_dotenv re-exported for tests)
 
 # Alive, 9 active conditions, 4 active medications, 8 recorded allergies.
 DEMO_PATIENT = "d477c46c-6e56-e32f-0c28-7356caab1e8b"
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def mcp_client(fhir_base_url: str) -> MultiServerMCPClient:
-    return MultiServerMCPClient({
-        "fhir": {
-            "transport": "stdio",
-            "command": sys.executable,
-            "args": ["-m", "src.agent.mcp_server"],
-            "cwd": str(ROOT),
-            "env": {**os.environ, "FHIR_BASE_URL": fhir_base_url, "FASTMCP_LOG_LEVEL": "WARNING"},
-        }
-    })
-
-
-def load_dotenv(path: Path = ROOT / ".env") -> None:
-    """KEY=value lines from the gitignored .env, for settings like AWS_BEARER_TOKEN_BEDROCK that must
-    never be committed or typed into a shared terminal. Variables already set win."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        key, sep, value = line.strip().partition("=")
-        if sep and key and not key.startswith("#"):
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def ask_decision(args: argparse.Namespace) -> dict[str, Any]:
     action = args.decision
     while action not in ("approve", "reject"):
         action = input("\nApprove this summary for release? [approve/reject]: ").strip().lower()
-    reason = args.reason if args.reason is not None else input("Reason (optional): ").strip()
+    reason = args.reason if args.reason is not None else input("Reason: ").strip()
+    while action == "reject" and not reason:
+        reason = input("A rejection needs a reason: ").strip()
     return {"action": action, "reviewer": args.reviewer, "reason": reason}
+
+
+async def pending_review(graph: Any, config: dict) -> dict | None:
+    """The interrupt payload of a paused thread, or None if nothing is waiting for review."""
+    snapshot = await graph.aget_state(config)
+    if not snapshot.next or not snapshot.tasks or not snapshot.tasks[0].interrupts:
+        return None
+    return snapshot.tasks[0].interrupts[0].value
+
+
+def show_review(review: dict) -> None:
+    if review.get("error"):
+        return  # the summary was already shown; only the decision is asked again
+    print(review["summary"])
+    print(f"\nChecks: {len(review['problems'])} problem(s), "
+          f"{review['injection_flags']} injection-like span(s) redacted from the record"
+          + (f", incomplete lists: {', '.join(review['truncated'])}" if review.get("truncated") else ""))
+    for p in review["problems"]:
+        print(f"  - [{p['kind']}] {p['msg']}")
+
+
+async def run_with_graph(graph: Any, saver: Any, args: argparse.Namespace) -> dict:
+    thread = args.thread or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread}}
+    try:
+        if args.thread:
+            review = await pending_review(graph, config)
+            if review is None:
+                print(f"Thread {thread} has nothing pending.")
+                return {"status": "nothing_pending"}
+        else:
+            print(f"Thread: {thread}\n")
+            result = await graph.ainvoke({"synthea_id": args.patient}, config)
+            review = result["__interrupt__"][0].value if "__interrupt__" in result else None
+        while review is not None:
+            show_review(review)
+            # ask_decision always returns a dict: Command(resume=None) crashes inside LangGraph 1.0.8.
+            result = await graph.ainvoke(Command(resume=ask_decision(args)), config)
+            review = result["__interrupt__"][0].value if "__interrupt__" in result else None
+            if review is not None:  # the graph refused the decision and asked again
+                print(f"\nDecision not accepted: {review['error']}")
+                args.decision = args.reason = None
+    except Exception as exc:
+        state = (await graph.aget_state(config)).values
+        print(f"\nRun failed ({type(exc).__name__}: {exc}). Audited as failed: {audit_failure(state, exc)}")
+        raise
+    # Finalized: the audit has the refs and hashes; the checkpoint's copy of the record goes.
+    await saver.adelete_thread(thread)
+    return result
 
 
 async def run(args: argparse.Namespace) -> int:
     narrator = make_narrator()
-    print(f"Model: {model_id() or 'none (code-written sections only)'}")
+    print(f"Model: {narrator.model_id if narrator else 'none (code-written sections only)'}")
 
-    async with mcp_client(args.fhir_base_url).session("fhir") as session:
-        advertised = {t.name for t in (await session.list_tools()).tools}
-        if advertised != TOOL_ALLOW_LIST:
-            print(f"Refusing to run: server tools {sorted(advertised ^ TOOL_ALLOW_LIST)} differ from the allow-list")
-            return 2
+    try:
+        async with fhir_tools(args.fhir_base_url) as (call_tool, _):
+            Path(args.state_db).parent.mkdir(parents=True, exist_ok=True)
+            async with AsyncSqliteSaver.from_conn_string(args.state_db) as saver:
+                result = await run_with_graph(build_graph(call_tool, narrator, checkpointer=saver), saver, args)
+    except PermissionError as exc:
+        print(f"Refusing to run: {exc}")
+        return 2
 
-        async def call_tool(name: str, tool_args: dict[str, Any]) -> dict[str, Any]:
-            if name not in TOOL_ALLOW_LIST:
-                raise PermissionError(f"{name} is not an allowed tool")
-            result = await session.call_tool(name, tool_args)
-            if result.isError:
-                raise RuntimeError(f"{name} failed: {' '.join(getattr(c, 'text', '') for c in result.content)}")
-            return result.structuredContent or {}
-
-        Path(args.state_db).parent.mkdir(parents=True, exist_ok=True)
-        async with AsyncSqliteSaver.from_conn_string(args.state_db) as saver:
-            graph = build_graph(call_tool, narrator, checkpointer=saver)
-            thread = args.thread or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": thread}}
-
-            if args.thread:
-                snapshot = await graph.aget_state(config)
-                if not snapshot.next:
-                    print(f"Thread {thread} has nothing pending.")
-                    return 1
-                result = {"__interrupt__": snapshot.tasks[0].interrupts}
-            else:
-                print(f"Thread: {thread}\n")
-                result = await graph.ainvoke({"synthea_id": args.patient}, config)
-
-            if "__interrupt__" in result:
-                review = result["__interrupt__"][0].value
-                print(review["summary"])
-                print(f"\nChecks: {len(review['problems'])} problem(s), "
-                      f"{review['injection_flags']} injection-like span(s) redacted from the record")
-                for p in review["problems"]:
-                    print(f"  - {p}")
-                result = await graph.ainvoke(Command(resume=ask_decision(args)), config)
-
+    if result["status"] == "nothing_pending":
+        return 1
     print(f"\nStatus: {result['status']}   audit: {result.get('audit_path')}")
     return 0 if result["status"] == "released" else 1
 
@@ -118,8 +121,9 @@ def main() -> None:
     ap.add_argument("--patient", default=DEMO_PATIENT, help="Synthea patient UUID")
     ap.add_argument("--fhir-base-url", default=os.environ.get("FHIR_BASE_URL", "http://localhost:8080/fhir"))
     ap.add_argument("--decision", choices=["approve", "reject"], help="skip the prompt (scripted runs)")
-    ap.add_argument("--reason", help="reason recorded with the decision")
-    ap.add_argument("--reviewer", default=getpass.getuser())
+    ap.add_argument("--reason", help="reason recorded with the decision (required to reject)")
+    ap.add_argument("--reviewer", default=getpass.getuser(),
+                    help="who decided; a real deployment takes this from the authenticated session")
     ap.add_argument("--thread", help="resume a paused run by its thread id")
     ap.add_argument("--state-db", default="data/agent_state.db")
     sys.exit(asyncio.run(run(ap.parse_args())))
